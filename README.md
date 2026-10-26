@@ -18,40 +18,14 @@ gets scanned too).
 
 ## Prior work
 
-### Before Ekko
-
-Early masks were a thread that XOR'd the region, called `Sleep`, XOR'd it
-back. Broken easily: during the sleep the thread's stack held return
-addresses into the encrypted region, which is a signal in itself.
-
-### Ekko (C5pider, 2022)
-
-Ekko was the inflection point. A timer-queue callback drives a ROP chain
-through the full state machine with no stack frame pointing into the beacon:
-
-1. Register a callback via `CreateTimerQueueTimer`.
-2. The callback is a ROP chain that captures context, flips the region to
-   RW, encrypts with `SystemFunction032` (RC4), waits on a handle (the
-   "sleep"), decrypts, flips back to RX, and `NtContinue`s into the captured
-   context.
-
-Each gadget `ret`s to the next. During the sleep the stack holds the ROP
-chain (pointers into `ntdll`/`kernel32`), not the beacon.
-
-### After Ekko
-
-The modern canon is variations on Ekko:
-
-- **FOLIAGE** — refined the state machine, polished the `VirtualProtect` dance.
-- **Cronos** — reworked orchestration around timer queues with different
-  trigger semantics.
-- **SleepyCrypt** — earlier variant.
-- **AceLdr** — Ekko-style masking plus module stomping.
-- **DeathSleep** — APC-based orchestration to cut the timer-queue surface.
-
-All advance the same axis: cleaner stack during sleep, less heuristic
-surface, better IOC hygiene around `VirtualProtect` frequency and shape. The
-architecture (ROP-driven orchestration external to the beacon) is constant.
+- **gargoyle** (Lospinoso, 2017) — first public sleep mask: ROP + APC in `ntdll`, XOR flip. Set the pattern: encrypt at rest, decrypt on wake, stack off your own shellcode.
+  - **YouMayPasser** (waldo-irc, 2022) — x64 reimplementation of gargoyle. Timer trigger instead of APC, `SetThreadContext` for start-address spoofing.
+- **FOLIAGE** (SecIdiot, ~2021) — APC-queued ROP chain + `NtContinue` to restore context around an encrypted sleep window. Pre-Ekko.
+  - **AceLdr** (Avery, 2022) — FOLIAGE mask inside a stomped module. Backing store looks like an image on disk, not private memory. Two IOCs down to one.
+- **SleepyCrypt** (SolomonSklash, 2021) — inline encrypt → `Sleep` → decrypt on the current thread. No timer, no APC, no ROP, no context swap.
+- **Ekko** (C5pider, 2022) — timer-queue callback, ROP chain in `ntdll`, RC4 via `SystemFunction032`, `NtContinue` back to the captured context. Stack never points at the beacon during sleep.
+  - **Cronos** (Idov31, 2022) — explicit Ekko derivative. `WaitableTimer` + APC instead of timer-queue; `QuadSleep` ROP wrapper splits the sleep across four `SleepEx` calls to break stack-walk heuristics.
+- **DeathSleep** (janoglezcampos, 2022) — terminates the thread during sleep and reconstructs it afterward. No live thread to inspect while the region is encrypted.
 
 ### The shared assumption
 
