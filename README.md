@@ -16,6 +16,8 @@ something else has to drive the encrypt/sleep/decrypt cycle, touch
 IOC and without leaving the stack pointing at the encrypted region (the stack
 gets scanned too).
 
+Also in this repo: [`faulty.c`](./faulty.c) — the IAT-hook trampoline variant for DLL beacons. Same core mechanics as Hermit, but targeting the beacon's `.data` section (C2 config, string table) instead of a shellcode region, so `.text` stays RX for the whole sleep window.
+
 ## Prior work
 
 - **gargoyle** (Lospinoso, 2017) — first public sleep mask: ROP + APC in `ntdll`, XOR flip. Set the pattern: encrypt at rest, decrypt on wake, stack off your own shellcode.
